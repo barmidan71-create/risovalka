@@ -4,8 +4,8 @@
  * Сообщения игра→платформа: {source:'masyka-game', type, payload}
  * Сообщения платформа→игра: {source:'masyka-host', type, payload}
  *
- * Вне платформы (открыли напрямую) — мультиплеер и лобби работают
- * через BroadcastChannel (кросс-таб в одном браузере).
+ * В платформе (iframe): мультиплеер через postMessage → WebSocket реле.
+ * Вне платформы (прямой URL): мультиплеер через BroadcastChannel (кросс-таб).
  */
 (function (global) {
   "use strict";
@@ -23,17 +23,21 @@
   var _initPayload = { lang: "ru" };
   var _myId = "p" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
 
-  // save/load pending
+  // save/load
   var _reqSeq = 0;
   var _pending = {};
 
-  // Multiplayer
-  var _mpChannel = null;
-  var _mpRoom = "";
-  var _mpPeers = [];
+  // Multiplayer (platform mode)
+  var _mpJoinResolver = null;
   var _mpMsgCbs = [];
   var _mpPeerJoinCbs = [];
   var _mpPeerLeftCbs = [];
+
+  // Multiplayer (broadcast fallback)
+  var _mpChannel = null;
+  var _mpRoom = "";
+  var _mpPeers = [];
+  var _mpMode = null; // "platform" | "broadcast"
 
   // Lobby
   var _LOBBY_CH = "masyka_lobby_discovery";
@@ -79,39 +83,6 @@
     });
   }
 
-  function _onMessage(ev) {
-    var d = ev && ev.data;
-    if (!d || d.source !== SRC_HOST) return;
-    _inPlatform = true;
-    switch (d.type) {
-      case "init":
-        _initPayload = d.payload || _initPayload;
-        if (!_ready) {
-          _ready = true;
-          _readyResolvers.forEach(function (r) { r(_initPayload); });
-          _readyResolvers = [];
-        }
-        break;
-      case "pause": _pauseCbs.forEach(function (cb) { try { cb(); } catch (e) {} }); break;
-      case "resume": _resumeCbs.forEach(function (cb) { try { cb(); } catch (e) {} }); break;
-      case "saveResult": case "loadResult": {
-        var pl = d.payload || {};
-        var entry = _pending[pl.reqId];
-        if (entry) {
-          delete _pending[pl.reqId];
-          clearTimeout(entry.timer);
-          if (pl.ok === false) entry.reject(new Error(pl.error || "save_error"));
-          else entry.resolve(d.type === "loadResult" ? (pl.data != null ? pl.data : null) : true);
-        }
-        break;
-      }
-    }
-  }
-
-  if (typeof window !== "undefined" && window.addEventListener) {
-    window.addEventListener("message", _onMessage, false);
-  }
-
   /* ---- BroadcastChannel: lobby ---- */
   function _ensureLobbyCh() {
     if (_lobbyCh) return _lobbyCh;
@@ -147,7 +118,7 @@
     _lobbyUpdateCbs.forEach(function (cb) { cb(list); });
   }
 
-  /* ---- BroadcastChannel: multiplayer ---- */
+  /* ---- BroadcastChannel: multiplayer fallback ---- */
   function _ensureMpCh(room) {
     if (_mpChannel) return _mpChannel;
     _mpRoom = room || "default";
@@ -168,6 +139,88 @@
       }
     };
     return _mpChannel;
+  }
+
+  /* ---- Message handler (platform messages) ---- */
+  function _onMessage(ev) {
+    var d = ev && ev.data;
+    if (!d || d.source !== SRC_HOST) return;
+    _inPlatform = true;
+
+    switch (d.type) {
+      case "init":
+        _initPayload = d.payload || _initPayload;
+        if (!_ready) {
+          _ready = true;
+          _readyResolvers.forEach(function (r) { r(_initPayload); });
+          _readyResolvers = [];
+        }
+        break;
+
+      case "pause":
+        _pauseCbs.forEach(function (cb) { try { cb(); } catch (e) {} });
+        break;
+
+      case "resume":
+        _resumeCbs.forEach(function (cb) { try { cb(); } catch (e) {} });
+        break;
+
+      case "saveResult":
+      case "loadResult": {
+        var pl = d.payload || {};
+        var entry = _pending[pl.reqId];
+        if (entry) {
+          delete _pending[pl.reqId];
+          clearTimeout(entry.timer);
+          if (pl.ok === false) entry.reject(new Error(pl.error || "save_error"));
+          else entry.resolve(d.type === "loadResult" ? (pl.data != null ? pl.data : null) : true);
+        }
+        break;
+      }
+
+      // ---- Мультиплеер через платформу ----
+      case "mpJoined": {
+        var resp = d.payload || {};
+        if (_mpJoinResolver) {
+          _mpMode = "platform";
+          if (resp.ok) {
+            _mpJoinResolver({ ok: true, playerId: resp.player_id, peers: resp.peers || [] });
+          } else {
+            _mpJoinResolver({ ok: false, error: resp.error || "join_failed" });
+          }
+          _mpJoinResolver = null;
+        }
+        break;
+      }
+
+      case "mpMessage": {
+        var mp = d.payload || {};
+        _mpMsgCbs.forEach(function (cb) { try { cb(mp.from, mp.data); } catch (e) {} });
+        break;
+      }
+
+      case "mpPeerJoined": {
+        var pid = d.payload && d.payload.player_id;
+        if (pid !== undefined) {
+          if (_mpPeers.indexOf(pid) === -1) _mpPeers.push(pid);
+          _mpPeerJoinCbs.forEach(function (cb) { try { cb(pid); } catch (e) {} });
+        }
+        break;
+      }
+
+      case "mpPeerLeft": {
+        var lid = d.payload && d.payload.player_id;
+        if (lid !== undefined) {
+          _mpPeers = _mpPeers.filter(function (p) { return p !== lid; });
+          _mpPeerLeftCbs.forEach(function (cb) { try { cb(lid); } catch (e) {} });
+        }
+        break;
+      }
+    }
+  }
+
+  if (typeof window !== "undefined" && window.addEventListener) {
+    window.addEventListener("message", _onMessage, false);
   }
 
   var MasykaSDK = {
@@ -289,25 +342,47 @@
     mpJoin: function (room) {
       if (!_ready) return Promise.resolve({ ok: false, error: "not_initialized" });
       _mpRoom = room || "default";
+      _mpPeers = [];
+
+      // В платформе — через postMessage → WebSocket
+      if (_inPlatform) {
+        _mpMode = "platform";
+        return new Promise(function (resolve) {
+          _mpJoinResolver = function (resp) { resolve(resp); };
+          _post("mpJoin", { room: _mpRoom });
+          setTimeout(function () {
+            if (_mpJoinResolver) { _mpJoinResolver({ ok: false, error: "timeout" }); _mpJoinResolver = null; }
+          }, 5000);
+        });
+      }
+
+      // Вне платформы — BroadcastChannel (кросс-таб)
+      _mpMode = "broadcast";
       var ch = _ensureMpCh(_mpRoom);
       if (!ch) return Promise.resolve({ ok: false, error: "broadcast_channel_unsupported" });
-      _mpPeers = [];
       ch.postMessage({ type: "peer_info", from: _myId });
       setTimeout(function () { if (_mpChannel) _mpChannel.postMessage({ type: "peer_info", from: _myId }); }, 200);
       return Promise.resolve({ ok: true, playerId: _myId, peers: [] });
     },
 
     mpSend: function (data) {
-      if (_mpChannel) _mpChannel.postMessage({ type: "mp_data", from: _myId, data: data });
+      if (_mpMode === "platform") {
+        _post("mpSend", { data: data });
+      } else if (_mpChannel) {
+        _mpChannel.postMessage({ type: "mp_data", from: _myId, data: data });
+      }
     },
 
     mpLeave: function () {
-      if (_mpChannel) {
+      if (_mpMode === "platform") {
+        _post("mpLeave");
+      } else if (_mpChannel) {
         try { _mpChannel.postMessage({ type: "peer_leave", from: _myId }); } catch (e) {}
         try { _mpChannel.close(); } catch (e) {}
       }
       _mpChannel = null;
       _mpPeers = [];
+      _mpMode = null;
     },
 
     onMpMessage: function (cb) { if (typeof cb === "function") _mpMsgCbs.push(cb); },
